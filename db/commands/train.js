@@ -1,20 +1,56 @@
 const db = require( '../config' ).db
 const functions = require( '../functions')
+const Passenger = require( './passenger' )
 
 class Train {
 
   constructor ( trainData ) {
-    this.trainNumber =  trainData.trainNumber
-    this.currentStation = trainData.currentStation || 'Downtown'
-    this.nextStation = trainData.nextStation || Train.getNextStation(this.currentStation)
-    this.capacity = trainData.capacity || 52
-    this.numberOfPassengers = trainData.numberOfPassengers || 0
+    const {
+      trainNumber,
+      currentStation,
+      nextStation,
+      capacity,
+      numberOfPassengers
+    } = trainData
+    this.trainNumber =  trainNumber
+    this.currentStation = currentStation || 'Downtown'
+    this.nextStation = nextStation
+    this.capacity = capacity || 52
+    this.numberOfPassengers = numberOfPassengers || 0
+  }
+
+  static create( trainData ) {
+    let newTrain = new Train( trainData )
+    return Promise.all([Train.getNextStation(newTrain.currentStation),newTrain])
+    .then( result => {
+      result[1].nextStation = result[0]
+      return result[1]
+    })
+    .then( train => train.save() )
+    .then( train => Train.find(trainData.trainNumber))
+  }
+
+
+  static getEmptyStations(){
+    return db.any(`SELECT * FROM stations WHERE station_name NOT IN (SELECT current_station FROM trains)`)
+  }
+
+  static getAllTrains() {
+    return db.any( `SELECT train_number FROM trains`)
+    .then(trains => Promise.all(
+      trains.map(train =>
+        Train.find( train.train_number )
+        )
+     ))
   }
 
   static getTrainNumber( currentStation ) {
-    return db.one( `SELECT * FROM trains WHERE current_station = $1`, currentStation )
+    return db.any( `SELECT * FROM trains WHERE current_station = $1`, currentStation )
     .then( train => {
-      return train.train_number
+      if ( !train.length ) {
+        throw new Error( 'No train at given station' )
+      }
+      return train[0].train_number
     })
     .catch( err => {
       throw err
@@ -24,6 +60,11 @@ class Train {
   static getNextStation( currentStation ) {
     return functions.getNextStation( currentStation )
     .then( result => result )
+  }
+
+  getNextStation() {
+    return functions.getNextStation( this.currentStation )
+    .then( result => this.nextStation = result )
   }
 
   save(){
@@ -73,7 +114,17 @@ class Train {
       })
       return closestTrain
     })
+    .then( train => {
+      return new Train({
+        trainNumber: train.train_number,
+        currentStation: train.current_station,
+        nextStation: train.next_station,
+        capacity: train.train_capacity,
+        numberOfPassenger: train.train_passengers
+      })
+    })
   }
+
 
   static getDistanceFromStation( trainNumber, stationNumber ){
     let distance = stationNumber - trainNumber
@@ -85,72 +136,102 @@ class Train {
 
 
   moveToNextStation() {
-    this.currentStation = this.nextStation
-    return Train.getNextStation(this.nextStation).then( result => {
-      this.nextStation = result
+    Train.findByStation( this.nextStation )
+    .then( result => {
+      if( result ){
+        throw new Error( 'Train number ' + result.trainNumber + ' is still at ' + this.nextStation)
+      }
+      else{
+        this.currentStation = this.nextStation
+        return Train.getNextStation(this.nextStation)
+        .then( result => this.nextStation = result )
+        .then( _ => this.update())
+      }
     })
-    .then( () => this )
   }
 
   offboard() {
-    let getOffboardingPassengers =
-      `SELECT * FROM passengers
-        WHERE train_number = $1
-          AND destination = $2`
-    db.any( getOffboardingPassengers, [ this.trainNumber, this.currentStation] )
+    return db.any( `SELECT id FROM passengers WHERE train_number = $1
+      AND destination = $2`, [ this.trainNumber, this.currentStation ] )
     .then( passengers => {
-      this.numberOfPassengers -= passengers.length
-      let updatePassengerTable =
-        `UPDATE passengers
-          SET ( train_number, station_name, origin, destination ) =
-            ( null, $1, $1, null ) WHERE id = $2`
-      passengers.forEach( passenger => db.none( updatePassengerTable, [ this.currentStation, passenger.id ] ) )
+      return Promise.all(passengers.map( passenger => {
+        return Passenger.findByID( passenger.id )
+      }))
+      .then( passengers => {
+        return passengers.forEach(passenger => {
+          if(passenger.destination === this.currentStation){
+            passenger.stationName = this.currentStation
+            passenger.trainNumber = null
+            passenger.destination = null
+            passenger.update()
+            this.numberOfPassengers--
+          }
+        })
+      })
     })
+    .then(() => this.update())
   }
 
   onboard() {
-    let getOnboardingPassengers =
-      `SELECT * FROM passengers
-        WHERE station_name = $1
-          AND destination IS NOT NULL`
-    db.any( getOnboardingPassengers, this.currentStation )
+    return Passenger.getAllAtStation( this.currentStation )
     .then( passengers => {
-      this.numberOfPassengers += passengers.length
-      let updatePassengerTable =
-        `UPDATE passengers
-          SET ( train_number, station_name ) =
-           ( $1, null ) WHERE id = $2`
-      passengers.forEach( passenger => db.none( updatePassengerTable, [ this.trainNumber, passenger.id ] ) )
+      return passengers.forEach(passenger => {
+        if(passenger.destination !== null){
+          passenger.stationName = null
+          passenger.trainNumber = this.trainNumber
+          passenger.update()
+          this.numberOfPassengers++
+        }
+      })
     })
+    .then(() => this.update())
   }
 
   static find( trainNumber ) {
     return db.one( `SELECT * FROM trains WHERE train_number = $1`, trainNumber )
     .then( train => {
-     train.train_number )
       return new Train({
-      trainNumber: train.train_number,
-      currentStation: train.current_station,
-      nextStation: train.next_station,
-      capacity: train.train_capacity,
-      numberOfPassengers: train.train_passengers
+        trainNumber: train.train_number,
+        currentStation: train.current_station,
+        nextStation: train.next_station,
+        capacity: train.train_capacity,
+        numberOfPassengers: train.train_passengers
       })
     })
+    .catch( err => { throw err } )
   }
 
-  static create( trainData ) {
-    return new Train( trainData )
+  static findByStation( stationName ){
+    return db.any( `SELECT * FROM trains WHERE current_station = $1`, stationName )
+    .then( train => {
+      if( train.length ){
+        return new Train({
+          trainNumber: train[0].train_number,
+          currentStation: train[0].current_station,
+          nextStation: train[0].next_station,
+          capacity: train[0].train_capacity,
+          numberOfPassengers: train[0].train_passengers
+        })
+      }
+      else{
+        return 'No train at that station'
+      }
+    })
   }
+
 
   delete() {
-    return db.none( `DELETE FROM trains WHERE train_number = $1`, this.trainNumber )
+    return db.none( `DELETE from trains WHERE train_number = $1`, this.trainNumber )
     .then( () => {
-      this.trainNumber = null
-      this.currentStation = null
-      this.nextStation = null
-      this.capacity = null
-      this.numberOfPassengers = null
+      let newTrain = new Train( this )
+      delete this.trainNumber
+      delete this.currentStation
+      delete this.nextStation
+      delete this.capacity
+      delete this.numberOfPassengers
+      return newTrain
     })
+    .catch( err => { throw err }  )
   }
 
   update(){
@@ -166,6 +247,10 @@ class Train {
         this.nextStation
       ]
     )
+    .then( () => {
+      return this
+    })
+    .catch( err => { throw err } )
   }
 }
 
